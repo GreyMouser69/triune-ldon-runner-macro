@@ -96,9 +96,16 @@ local AGGRO_DROP_AFTER_SEC = 30
 -- giving up on the adventure (stuck on a mob or a mesh trap)
 local BAIL_AFTER_MIN = 5
 
--- Morituri servers: what to say to the adventure giver after accepting
-local MORITURI_SAY = 'send you there'
+-- Morituri servers: the adventure giver's hail contains a clickable teleport
+-- link with this visible text. It has to be clicked through the chat window.
+local MORITURI_LINK_TEXT = 'send you there'
+local MORITURI_LINK = string.char(18)
+local MORITURI_WINDOW = 'ChatWindow'
+local MORITURI_OUTPUT = 'CW_ChatOutput'
+local MORITURI_EVENT = 'LDoN_MorituriLink'
 local MORITURI_ATTEMPTS = 3
+local MORITURI_CAPTURE_MS = 10000
+local MORITURI_READY_MS = 10000
 
 -- Adventures to turn down (the Everfrost meshes can't handle these): if the
 -- offer text names one, decline it and request again, as many times as it
@@ -808,9 +815,58 @@ local function enterDungeon()
     sleep(5000)
 end
 
+-- Extract the clickable teleport code from the raw chat line. This deliberately
+-- ignores TextTagInfo.text and the item id: this server's link has a 77-byte
+-- tagged body, while MacroQuest's item-link parser expects the stock width.
+local function morituriLinkCode(raw)
+    if type(raw) ~= 'string' then return nil end
+    for body in raw:gmatch(MORITURI_LINK .. '(.-)' .. MORITURI_LINK) do
+        if #body >= 9 and body:sub(1, 1) == '0' then
+            local markerAt = body:find(MORITURI_LINK_TEXT, 78, true)
+            if not markerAt then markerAt = body:find(MORITURI_LINK_TEXT, 1, true) end
+            if markerAt then
+                local tagged = body:sub(1, markerAt - 1)
+                local code = tagged:sub(2)
+                if #tagged == 77 and #code == 76 then return code end
+            end
+        end
+    end
+    return nil
+end
+
+local function morituriCanExecute()
+    if tlo(function() return mq.TLO.EverQuest.GameState() end, '') ~= 'INGAME' then return false end
+    if tlo(function() return mq.TLO.Me.Zoning() end, false) == true then return false end
+    if zoneId() == 0 then return false end
+    if tlo(function() return mq.TLO.Me.ID() end, 0) == 0 then return false end
+    return zoneShort() ~= ''
+end
+
+-- Register the capture event immediately before the hail and always remove it
+-- again, including when waitFor/checkInterrupt aborts the attempt.
+local function captureMorituriLink()
+    local found = nil
+    local function onLine(raw)
+        if found then return end
+        found = morituriLinkCode(raw)
+    end
+
+    local ok, err = pcall(function()
+        mq.unevent(MORITURI_EVENT)
+        mq.event(MORITURI_EVENT, '#*#', onLine, { keepLinks = true })
+        mq.cmd('/hail')
+        waitFor(MORITURI_CAPTURE_MS, function() return found ~= nil end)
+    end)
+
+    local okUn, errUn = pcall(function() mq.unevent(MORITURI_EVENT) end)
+    if not ok then error(err, 0) end
+    if not okUn then error(errUn, 0) end
+    return found
+end
+
 -- Morituri servers send the character straight into the instance from the
 -- adventure giver once the adventure is accepted. Stay at (or walk back to)
--- the giver, hail it, and ask for the port.
+-- the giver, hail it, capture its teleport link, and click that link.
 local function enterDungeonMorituri()
     local c = camp()
     local startZoneId = zoneId()
@@ -863,28 +919,39 @@ local function enterDungeonMorituri()
     end
 
     for attempt = 1, MORITURI_ATTEMPTS do
-        npcID = tlo(function() return mq.TLO.Spawn('npc ' .. c.questNPC).ID() end, 0)
-        if npcID == 0 then fail("Can't find %s for the Morituri teleport. Ending.", c.questNPC) end
-        mq.cmdf('/target id %d', npcID)
-        waitFor(2000, function() return mq.TLO.Target.ID() == npcID end)
-        mq.cmd('/face fast')
-        sleep(300)
-        makeVisible()
-        mq.cmd('/hail')
-        sleep(300)
-        mq.cmdf('/say %s', MORITURI_SAY)
-        if waitFor(30000, function()
-            local id = zoneId()
-            return id ~= 0 and id ~= startZoneId
-        end) then
-            if not waitFor(60000, morituriZoneReady) then
-                fail("Morituri started zoning me, but the character wasn't ready. Ending.")
+        if not waitFor(MORITURI_READY_MS, morituriCanExecute) then
+            log('Morituri teleport attempt %d of %d skipped: character not ready.', attempt, MORITURI_ATTEMPTS)
+        else
+            npcID = tlo(function() return mq.TLO.Spawn('npc ' .. c.questNPC).ID() end, 0)
+            if npcID == 0 then fail("Can't find %s for the Morituri teleport. Ending.", c.questNPC) end
+            mq.cmdf('/target id %d', npcID)
+            waitFor(2000, function() return mq.TLO.Target.ID() == npcID end)
+            mq.cmd('/face fast')
+            sleep(300)
+            makeVisible()
+
+            local code = captureMorituriLink()
+            if not code then
+                log('Morituri teleport link was not captured on attempt %d of %d.', attempt, MORITURI_ATTEMPTS)
+            elseif not waitFor(MORITURI_READY_MS, morituriCanExecute) then
+                log('Morituri link captured, but character was not ready to execute it on attempt %d of %d.',
+                    attempt, MORITURI_ATTEMPTS)
+            else
+                mq.cmdf('/notify %s %s link %s', MORITURI_WINDOW, MORITURI_OUTPUT, code)
+                if waitFor(30000, function()
+                    local id = zoneId()
+                    return id ~= 0 and id ~= startZoneId
+                end) then
+                    if not waitFor(60000, morituriZoneReady) then
+                        fail("Morituri started zoning me, but the character wasn't ready. Ending.")
+                    end
+                    sleep(5000)
+                    log('Morituri sent me into the dungeon.')
+                    return
+                end
+                log('Morituri teleport attempt %d of %d did not change zones.', attempt, MORITURI_ATTEMPTS)
             end
-            sleep(5000)
-            log('Morituri sent me into the dungeon.')
-            return
         end
-        log('Morituri teleport attempt %d of %d did not change zones.', attempt, MORITURI_ATTEMPTS)
         sleep(2000)
     end
     fail("Morituri didn't teleport me after %d attempts. Ending.", MORITURI_ATTEMPTS)
@@ -1830,7 +1897,7 @@ local function DrawLDoNUI()
         local mor, morChanged = ImGui.Checkbox('Morituri Server Mode##ldonMorituri', settings.morituri)
         if morChanged then settings.morituri = mor; saveConfig() end
         if ImGui.IsItemHovered() then
-            ImGui.SetTooltip('Hail the adventure giver and say "' .. MORITURI_SAY .. '" instead of travelling to the dungeon entrance')
+            ImGui.SetTooltip('Hail the adventure giver and click the "' .. MORITURI_LINK_TEXT .. '" teleport link instead of travelling to the dungeon entrance')
         end
         if state.active then ImGui.EndDisabled() end
 
