@@ -47,6 +47,9 @@ local settings = {
     typeIndex = 3,
     -- Minutes to wait for the adventure to complete before leaving anyway
     maxClearMin = 90,
+    killEverything = false,
+    killEverythingStallMin = 5,
+    killEverythingMaxMin = 15,
     -- If the recruiter refuses to give an adventure, run one loop at this camp
     -- instead (getting there by Magus), then go back.
     -- 'random' = any other camp, 'none' = just stop.
@@ -56,13 +59,33 @@ local settings = {
     morituri = false,
 }
 
+local function clampInt(v, lo, hi)
+    v = tonumber(v)
+    if not v or v ~= v then return lo end
+    v = math.floor(v)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
 -- Triune auto combat puller
 local PULLER_MODE_CMD   = '/ac puller'
+local PULLER_HUNT_CMD   = '/ac puller hunt'
 local PULLER_ON_CMD     = '/ac run'
 -- stops chasing new mobs but keeps fighting what's already on me
 local PULLER_MANUAL_CMD = '/ac manual'
 -- only sent once combat is completely over
 local PULLER_OFF_CMD    = '/ac stop'
+
+local KILL_STALL_MIN, KILL_STALL_MAX = 1, 120
+local KILL_MAX_MIN, KILL_MAX_MAX = 1, 240
+local KILL_POLL_MS = 1000
+local KILL_SCAN_MS = 2000
+local KILL_QUIET_MS = 5000
+local KILL_EMPTY_SCANS = 2
+local KILL_SCAN_CAP = 250
+local KILL_CHURN_MS = 60000
+local KILL_CHURN_PROGRESS_MS = 30000
 
 -- After the adventure is won: if I'm still in combat with no hits either way
 -- for this many seconds, something is stuck on the hate list (it blocks Bazaar
@@ -242,6 +265,8 @@ local state = {
     advWon = false,
     died = false,
     lastHit = 0,
+    killLastProgress = 0,
+    triuneEngaged = false,
     runs = 0,
     step = 'Idle',
     startedAt = 0,
@@ -278,6 +303,9 @@ local function saveConfig()
     file:write(string.format('    riskIndex = %d,\n', settings.riskIndex))
     file:write(string.format('    typeIndex = %d,\n', settings.typeIndex))
     file:write(string.format('    maxClearMin = %d,\n', settings.maxClearMin))
+    file:write(string.format('    killEverything = %s,\n', settings.killEverything and 'true' or 'false'))
+    file:write(string.format('    killEverythingStallMin = %d,\n', settings.killEverythingStallMin))
+    file:write(string.format('    killEverythingMaxMin = %d,\n', settings.killEverythingMaxMin))
     file:write(string.format('    fallbackCamp = %q,\n', settings.fallbackCamp))
     file:write(string.format('    morituri = %s,\n', settings.morituri and 'true' or 'false'))
     file:write('}\n')
@@ -294,6 +322,11 @@ local function loadConfig()
     settings.riskIndex = tonumber(data.riskIndex) or settings.riskIndex
     settings.typeIndex = tonumber(data.typeIndex) or settings.typeIndex
     settings.maxClearMin = tonumber(data.maxClearMin) or settings.maxClearMin
+    if type(data.killEverything) == 'boolean' then settings.killEverything = data.killEverything end
+    local stall = tonumber(data.killEverythingStallMin)
+    local maxExtra = tonumber(data.killEverythingMaxMin)
+    if stall then settings.killEverythingStallMin = clampInt(stall, KILL_STALL_MIN, KILL_STALL_MAX) end
+    if maxExtra then settings.killEverythingMaxMin = clampInt(maxExtra, KILL_MAX_MIN, KILL_MAX_MAX) end
     if CAMPS[data.fallbackCamp] or data.fallbackCamp == 'random' or data.fallbackCamp == 'none' then
         settings.fallbackCamp = data.fallbackCamp
     end
@@ -369,6 +402,12 @@ local function waitFor(ms, cond)
 end
 
 local function sleep(ms) waitFor(ms) end
+
+local function stopTriuneIfEngaged()
+    if not state.triuneEngaged then return end
+    state.triuneEngaged = false
+    mq.cmd(PULLER_OFF_CMD)
+end
 
 local function cleanupMovement()
     mq.cmd('/nav stop')
@@ -877,9 +916,256 @@ local function dropAggro()
         table.concat(AGGRO_DROP_LIST, ', '))
 end
 
+local function spawnExistsAlive(s)
+    if not s then return false, false end
+    local exists = tlo(function() return s() end, false) == true
+    if not exists then return false, false end
+    local dead = tlo(function() return s.Dead() end, false) == true
+    local stype = tlo(function() return s.Type() end, '') or ''
+    local sstate = tlo(function() return s.State() end, '') or ''
+    return true, not dead and stype ~= 'Corpse' and sstate ~= 'DEAD'
+end
+
+local function spawnOwnedByFriendly(s, stype, name)
+    local sid = tlo(function() return s.ID() end, 0) or 0
+    local petId = tlo(function() return mq.TLO.Me.Pet.ID() end, 0) or 0
+    if sid > 0 and sid == petId then return true end
+    local function ownedByFriendly(ref)
+        local ok, owner = pcall(ref)
+        if not ok or not owner then return false end
+        if tlo(function() return owner() end, false) ~= true then return false end
+        local oid = tlo(function() return owner.ID() end, 0)
+        local myId = tlo(function() return mq.TLO.Me.ID() end, 0)
+        local otype = tlo(function() return owner.Type() end, '') or ''
+        if oid == myId then return true end
+        return otype == 'PC' or otype == 'Mercenary'
+    end
+    local okMaster, master = pcall(function() return s.Master end)
+    if okMaster and ownedByFriendly(master) then return true end
+    local okOwner, owner = pcall(function() return s.Owner end)
+    if okOwner and ownedByFriendly(owner) then return true end
+    if stype == 'Pet' then
+        local lower = string.lower(name or '')
+        if lower:find("'s pet", 1, true)
+            or lower:find("`s pet", 1, true)
+            or lower:find("'s warder", 1, true)
+            or lower:find("`s warder", 1, true)
+            or lower:find("'s familiar", 1, true)
+            or lower:find("`s familiar", 1, true)
+            or lower:find('(owner:', 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function isEligibleSpawn(s)
+    local exists, alive = spawnExistsAlive(s)
+    if not exists or not alive then return false end
+    local stype = tlo(function() return s.Type() end, '') or ''
+    if stype ~= 'NPC' and stype ~= 'Pet' then return false end
+    if tlo(function() return s.Trader() end, false) == true then return false end
+    if tlo(function() return s.Targetable() end, true) == false then return false end
+    local name = tlo(function() return s.CleanName() end, '') or ''
+    return not spawnOwnedByFriendly(s, stype, name)
+end
+
+local function countEligibleSpawn(s, seen)
+    local id = tlo(function() return s.ID() end, 0) or 0
+    if id <= 0 or seen[id] then return 0 end
+    seen[id] = true
+    if isEligibleSpawn(s) then return 1 end
+    return 0
+end
+
+local function scanEligibleNpcs()
+    local found = 0
+    local seen = {}
+    for i = 1, KILL_SCAN_CAP do
+        local ok, s = pcall(function() return mq.TLO.NearestSpawn(i, 'npc') end)
+        if not ok then return KILL_SCAN_CAP end
+        if not s then break end
+        local okExists, exists = pcall(function() return s() end)
+        if not okExists then return KILL_SCAN_CAP end
+        if not exists then break end
+        if i == KILL_SCAN_CAP then return KILL_SCAN_CAP end
+        found = found + countEligibleSpawn(s, seen)
+    end
+
+    found = found + countEligibleSpawn(mq.TLO.Target, seen)
+    local slots = clampInt(tlo(function() return mq.TLO.Me.XTargetSlots() end, 13) or 13, 0, 100)
+    for i = 1, slots do
+        found = found + countEligibleSpawn(mq.TLO.Me.XTarget(i), seen)
+    end
+    return found
+end
+
+local function killScanReady()
+    if state.died then return false end
+    if tlo(function() return mq.TLO.Me.Zoning() end, false) == true then return false end
+    if tlo(function() return mq.TLO.Me.Dead() end, false) == true then return false end
+    local meID = tlo(function() return mq.TLO.Me.ID() end, 0)
+    return meID ~= 0 and zoneId() ~= 0 and zoneShort() ~= ''
+end
+
+local function observeTargets(watched)
+    local current = {}
+    local seen = {}
+    local progress = false
+    local currentTargetId = tlo(function() return mq.TLO.Target.ID() end, 0) or 0
+
+    local function observe(s, id)
+        if id <= 0 or seen[id] then return end
+        seen[id] = true
+        local exists, alive = spawnExistsAlive(s)
+        if not exists then return end
+        local prev = watched[id]
+        local eligible = isEligibleSpawn(s)
+        if not eligible and not prev then return end
+        local hp = tlo(function() return s.PctHPs() end, nil)
+        if prev and prev.alive and alive and prev.hp and hp and hp < prev.hp then
+            progress = true
+        end
+        if prev and prev.alive and not alive then progress = true end
+        current[id] = {
+            hp = hp or (prev and prev.hp),
+            alive = alive,
+            name = tlo(function() return s.CleanName() end, '') or '',
+        }
+    end
+
+    if currentTargetId > 0 then
+        observe(mq.TLO.Spawn(currentTargetId), currentTargetId)
+    end
+    local slots = clampInt(tlo(function() return mq.TLO.Me.XTargetSlots() end, 13) or 13, 0, 100)
+    for i = 1, slots do
+        local xt = mq.TLO.Me.XTarget(i)
+        local id = tlo(function()
+            if xt() then return xt.ID() end
+            return 0
+        end, 0) or 0
+        if id > 0 then observe(xt, id) end
+    end
+    return current, progress, currentTargetId
+end
+
+local function clearRemainingDungeon()
+    local started = mq.gettime()
+    local stallMs = settings.killEverythingStallMin * 60 * 1000
+    local maxMs = settings.killEverythingMaxMin * 60 * 1000
+    state.killLastProgress = started
+
+    local watched = {}
+    local lastTargetId = 0
+    local targetHistory = {}
+    local churnLogged = false
+    local nextPoll = 0
+    local nextScan = 0
+    local emptySince = nil
+    local emptyScans = 0
+    local doneReason = nil
+
+    local initial = scanEligibleNpcs()
+    log('Kill Everything enabled: clearing remaining NPCs (%d client-visible; stall %d min, max %d min).',
+        initial, settings.killEverythingStallMin, settings.killEverythingMaxMin)
+    setStep('Kill Everything (%d visible)', initial)
+
+    state.triuneEngaged = true
+    mq.cmd(PULLER_HUNT_CMD)
+    sleep(500)
+    mq.cmd(PULLER_ON_CMD)
+
+    waitFor(math.max(1, maxMs - (mq.gettime() - started)), function()
+        local now = mq.gettime()
+
+        if now >= nextPoll then
+            nextPoll = now + KILL_POLL_MS
+            local current, progress, targetId = observeTargets(watched)
+            watched = current
+            if progress then state.killLastProgress = now end
+
+            if targetId ~= lastTargetId then
+                if targetId > 0 then
+                    local ts = mq.TLO.Spawn(targetId)
+                    local name = tlo(function() return ts.CleanName() end, '') or ''
+                    targetHistory[#targetHistory + 1] = { id = targetId, name = name, at = now }
+                end
+                lastTargetId = targetId
+            end
+            local cutoff = now - KILL_CHURN_MS
+            while #targetHistory > 0 and targetHistory[1].at < cutoff do
+                table.remove(targetHistory, 1)
+            end
+            if not churnLogged and #targetHistory >= 4
+                and now - state.killLastProgress >= KILL_CHURN_PROGRESS_MS then
+                local n = #targetHistory
+                local a, b, c, d = targetHistory[n - 3], targetHistory[n - 2],
+                    targetHistory[n - 1], targetHistory[n]
+                if (a.id == c.id and b.id == d.id and a.id ~= b.id) or #targetHistory >= 6 then
+                    churnLogged = true
+                    local an = a.name ~= '' and a.name or string.format('#%d', a.id)
+                    local bn = b.name ~= '' and b.name or string.format('#%d', b.id)
+                    log('Kill Everything: suspected target-switch loop (%s <-> %s, %d changes in %ds, '
+                        .. 'no progress for %ds); continuing until the no-progress timeout.',
+                        an, bn, #targetHistory, math.floor(KILL_CHURN_MS / 1000),
+                        math.floor((now - state.killLastProgress) / 1000))
+                end
+            end
+        end
+
+        if now >= nextScan then
+            nextScan = now + KILL_SCAN_MS
+            local remaining = scanEligibleNpcs()
+            local combat = tlo(function() return mq.TLO.Me.Combat() end, false) == true
+                or tlo(function() return mq.TLO.Me.CombatState() end, '') == 'COMBAT'
+            local ready = killScanReady()
+            if remaining == 0 and not combat and ready then
+                if not emptySince then
+                    emptySince = now
+                    emptyScans = 0
+                end
+                emptyScans = emptyScans + 1
+                if emptyScans >= KILL_EMPTY_SCANS and now - emptySince >= KILL_QUIET_MS then
+                    doneReason = 'complete'
+                    return true
+                end
+            else
+                emptySince = nil
+                emptyScans = 0
+            end
+            if remaining > 0 then
+                setStep('Kill Everything (%d visible)', remaining)
+            elseif ready then
+                setStep('Kill Everything (waiting for quiet)')
+            else
+                setStep('Kill Everything (waiting for game state)')
+            end
+        end
+
+        if now - state.killLastProgress >= stallMs then
+            doneReason = 'stall'
+            return true
+        end
+        return false
+    end)
+
+    if not doneReason then doneReason = 'max' end
+    if doneReason == 'complete' then
+        log('Kill Everything: no eligible living NPCs were found after a %d-second quiet period; leaving.',
+            math.floor(KILL_QUIET_MS / 1000))
+    elseif doneReason == 'stall' then
+        log('Kill Everything: no combat progress for %d minutes; stopping and leaving.',
+            settings.killEverythingStallMin)
+    else
+        log('Kill Everything: maximum additional clearing time (%d minutes) reached; stopping and leaving.',
+            settings.killEverythingMaxMin)
+    end
+end
+
 local function clearDungeon()
     state.advWon = false
     setStep('Clearing dungeon (TAC puller)')
+    state.triuneEngaged = true
     mq.cmd(PULLER_MODE_CMD)
     sleep(1000)
     mq.cmd(PULLER_ON_CMD)
@@ -912,6 +1198,10 @@ local function clearDungeon()
         log('Timed out without a win message, leaving anyway.')
     end
 
+    if state.advWon and settings.killEverything then
+        clearRemainingDungeon()
+    end
+
     -- stop pulling, but keep fighting whatever is still on me
     setStep('Finishing combat')
     mq.cmd(PULLER_MANUAL_CMD)
@@ -941,6 +1231,7 @@ local function clearDungeon()
 
     mq.cmd(PULLER_OFF_CMD)
     sleep(2000)
+    state.triuneEngaged = false
 end
 
 -- In the Bazaar: walk to the map and port to this camp's waypoint
@@ -1199,6 +1490,7 @@ local function runSession()
     state.stopRequested = false
     state.died = false
     state.advWon = false
+    state.triuneEngaged = false
     state.startedAt = mq.gettime()
     local ok, err = pcall(adventureLoop)
     if not ok then
@@ -1208,8 +1500,10 @@ local function runSession()
             log('Error: %s', tostring(err))
         end
     end
+    stopTriuneIfEngaged()
     cleanupMovement()
     state.campKey = nil
+    state.killLastProgress = 0
     state.active = false
     state.stopRequested = false
     state.skipGet = false
@@ -1307,8 +1601,25 @@ local function ldonCommand(...)
         else
             log('Fallback camp is [%s]. Use: /ldon fallback <sro|ep|bm|ec|nro|random|none>', settings.fallbackCamp)
         end
+    elseif cmd == 'kill' then
+        local value = (args[2] or ''):lower()
+        if state.active then
+            log("Can't change Kill Everything while running.")
+        elseif value == 'on' or value == 'off' then
+            settings.killEverything = value == 'on'
+            saveConfig()
+            log('Kill Everything %s (stall %d min, max %d min).', value,
+                settings.killEverythingStallMin, settings.killEverythingMaxMin)
+        else
+            log('Kill Everything is %s (stall %d min, max %d min). Use /ldon kill on|off.',
+                settings.killEverything and 'on' or 'off',
+                settings.killEverythingStallMin, settings.killEverythingMaxMin)
+        end
     elseif cmd == 'status' then
-        log('%s | camp [%s] | runs %d | %s', state.active and 'Running' or 'Idle', settings.camp, state.runs, state.step)
+        log('%s | camp [%s] | runs %d | kill everything %s (stall %d min, max %d min) | %s',
+            state.active and 'Running' or 'Idle', settings.camp, state.runs,
+            settings.killEverything and 'on' or 'off',
+            settings.killEverythingStallMin, settings.killEverythingMaxMin, state.step)
     elseif cmd == 'show' then
         state.openGUI = true
     elseif cmd == 'hide' then
@@ -1319,7 +1630,7 @@ local function ldonCommand(...)
         requestStop()
         state.isRunning = false
     else
-        print(TAG .. 'usage: /ldon [start [camp] [skip] [loop] [bail]|stop|camp <sro|ep|bm|ec|nro>|fallback <camp|random|none>|status|show|hide|toggle|quit]')
+        print(TAG .. 'usage: /ldon [start [camp] [skip] [loop] [bail]|stop|camp <sro|ep|bm|ec|nro>|fallback <camp|random|none>|kill <on|off>|status|show|hide|toggle|quit]')
     end
 end
 
@@ -1478,6 +1789,36 @@ local function DrawLDoNUI()
         if ImGui.IsItemHovered() then ImGui.SetTooltip('Position in the adventure window Type dropdown (3 = Mob Count)') end
         local mins, mChanged = ImGui.InputInt('Max clear (min)##ldonMax', settings.maxClearMin)
         if mChanged then settings.maxClearMin = math.max(1, mins); saveConfig() end
+        ImGui.PopItemWidth()
+
+        local ke, keChanged = ImGui.Checkbox('Kill Everything##ldonKill', settings.killEverything)
+        if keChanged then
+            settings.killEverything = ke
+            saveConfig()
+        end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Keep pulling after the adventure is won until no eligible living NPCs remain')
+        end
+        ImGui.PushItemWidth(110)
+        local stall, stallChanged = ImGui.InputInt('Stall timeout (min)##ldonKillStall',
+            settings.killEverythingStallMin)
+        if stallChanged then
+            settings.killEverythingStallMin = clampInt(stall, KILL_STALL_MIN, KILL_STALL_MAX)
+            saveConfig()
+        end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Stop clearing when no meaningful combat progress has happened for this long')
+        end
+        ImGui.SameLine()
+        local extra, extraChanged = ImGui.InputInt('Max extra clear (min)##ldonKillMax',
+            settings.killEverythingMaxMin)
+        if extraChanged then
+            settings.killEverythingMaxMin = clampInt(extra, KILL_MAX_MIN, KILL_MAX_MAX)
+            saveConfig()
+        end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Absolute cap on additional clearing after the adventure is won')
+        end
         ImGui.PopItemWidth()
 
         local skip, sChanged = ImGui.Checkbox('Skip first request (already have an adventure)##ldonSkip', state.skipGet)
