@@ -51,6 +51,9 @@ local settings = {
     -- instead (getting there by Magus), then go back.
     -- 'random' = any other camp, 'none' = just stop.
     fallbackCamp = 'random',
+    -- Hail the adventure giver and say the Morituri phrase instead of
+    -- travelling to the dungeon entrance.
+    morituri = false,
 }
 
 -- Triune auto combat puller
@@ -69,6 +72,10 @@ local AGGRO_DROP_AFTER_SEC = 30
 -- With bail on: minutes inside the dungeon with no hits either way before
 -- giving up on the adventure (stuck on a mob or a mesh trap)
 local BAIL_AFTER_MIN = 5
+
+-- Morituri servers: what to say to the adventure giver after accepting
+local MORITURI_SAY = 'send you there'
+local MORITURI_ATTEMPTS = 3
 
 -- Adventures to turn down (the Everfrost meshes can't handle these): if the
 -- offer text names one, decline it and request again, as many times as it
@@ -272,6 +279,7 @@ local function saveConfig()
     file:write(string.format('    typeIndex = %d,\n', settings.typeIndex))
     file:write(string.format('    maxClearMin = %d,\n', settings.maxClearMin))
     file:write(string.format('    fallbackCamp = %q,\n', settings.fallbackCamp))
+    file:write(string.format('    morituri = %s,\n', settings.morituri and 'true' or 'false'))
     file:write('}\n')
     file:close()
 end
@@ -289,6 +297,7 @@ local function loadConfig()
     if CAMPS[data.fallbackCamp] or data.fallbackCamp == 'random' or data.fallbackCamp == 'none' then
         settings.fallbackCamp = data.fallbackCamp
     end
+    if type(data.morituri) == 'boolean' then settings.morituri = data.morituri end
 end
 
 -- ============================================================================
@@ -760,6 +769,88 @@ local function enterDungeon()
     sleep(5000)
 end
 
+-- Morituri servers send the character straight into the instance from the
+-- adventure giver once the adventure is accepted. Stay at (or walk back to)
+-- the giver, hail it, and ask for the port.
+local function enterDungeonMorituri()
+    local c = camp()
+    local startZoneId = zoneId()
+    if startZoneId == 0 then
+        fail("Couldn't read the current zone ID before the Morituri teleport. Ending.")
+    end
+    setStep('Teleporting with Morituri (%s)', c.questNPC)
+
+    -- Only the Morituri path needs the request window gone; normal travel
+    -- leaves it alone.
+    if windowOpen('AdventureRequestWnd') then
+        mq.cmd('/windowstate AdventureRequestWnd close')
+        waitFor(5000, function() return not windowOpen('AdventureRequestWnd') end)
+    end
+
+    local npcID = tlo(function() return mq.TLO.Spawn('npc ' .. c.questNPC).ID() end, 0)
+    if npcID == 0 then fail("Can't find %s for the Morituri teleport. Ending.", c.questNPC) end
+    if spawnDist(npcID) > 30 then
+        if c.campSpot then
+            if spawnDist(npcID) > 80 and meshLoaded() then
+                mq.cmdf('/nav locyxz %.2f %.2f %.2f', c.campSpot.y, c.campSpot.x, c.campSpot.z)
+                sleep(1000)
+                waitFor(5 * 60 * 1000, function() return not navActive() end)
+            end
+            mq.cmdf('/moveto id %d', npcID)
+            sleep(1000)
+            waitFor(30000, function() return mq.TLO.MoveTo.Stopped() end)
+        elseif spawnDist(npcID) > 15 then
+            mq.cmdf('/nav id %d', npcID)
+            sleep(1000)
+            waitFor(5 * 60 * 1000, function() return not navActive() end)
+        end
+    end
+    npcID = tlo(function() return mq.TLO.Spawn('npc ' .. c.questNPC).ID() end, 0)
+    if npcID == 0 then fail("Can't find %s for the Morituri teleport. Ending.", c.questNPC) end
+    if spawnDist(npcID) > 30 then
+        fail("Couldn't get back to %s for the Morituri teleport. Ending.", c.questNPC)
+    end
+
+    -- Stop movement before targeting and talking to the giver.
+    mq.cmd('/nav stop')
+    mq.cmd('/moveto off')
+
+    local function morituriZoneReady()
+        local id = zoneId()
+        if id == 0 or id == startZoneId then return false end
+        if tlo(function() return mq.TLO.Me.Zoning() end, false) == true then return false end
+        local meID = tlo(function() return mq.TLO.Me.ID() end, 0)
+        return meID ~= 0 and zoneShort() ~= ''
+    end
+
+    for attempt = 1, MORITURI_ATTEMPTS do
+        npcID = tlo(function() return mq.TLO.Spawn('npc ' .. c.questNPC).ID() end, 0)
+        if npcID == 0 then fail("Can't find %s for the Morituri teleport. Ending.", c.questNPC) end
+        mq.cmdf('/target id %d', npcID)
+        waitFor(2000, function() return mq.TLO.Target.ID() == npcID end)
+        mq.cmd('/face fast')
+        sleep(300)
+        makeVisible()
+        mq.cmd('/hail')
+        sleep(300)
+        mq.cmdf('/say %s', MORITURI_SAY)
+        if waitFor(30000, function()
+            local id = zoneId()
+            return id ~= 0 and id ~= startZoneId
+        end) then
+            if not waitFor(60000, morituriZoneReady) then
+                fail("Morituri started zoning me, but the character wasn't ready. Ending.")
+            end
+            sleep(5000)
+            log('Morituri sent me into the dungeon.')
+            return
+        end
+        log('Morituri teleport attempt %d of %d did not change zones.', attempt, MORITURI_ATTEMPTS)
+        sleep(2000)
+    end
+    fail("Morituri didn't teleport me after %d attempts. Ending.", MORITURI_ATTEMPTS)
+end
+
 -- Use the first aggro drop in AGGRO_DROP_LIST that I have and is ready
 -- (AAs like Fading Memories / Imitate Death, or a skill like Feign Death)
 local function dropAggro()
@@ -967,9 +1058,12 @@ local function preflight()
         log('Warning: triune.lua does not look like it is running, so the /ac puller commands may do nothing.')
     end
     local missing = 0
-    -- with a Magus shortcut the run to the entrance is only a fallback, so don't require its routes
-    if not c.magus then missing = missing + checkPath(c.campZone, c.ent1.path) end
-    if c.ent2 then missing = missing + checkPath(c.campZone, c.ent2.path) end
+    -- Morituri teleports straight into the dungeon, so entrance routes are not used
+    if not settings.morituri then
+        -- with a Magus shortcut the run to the entrance is only a fallback, so don't require its routes
+        if not c.magus then missing = missing + checkPath(c.campZone, c.ent1.path) end
+        if c.ent2 then missing = missing + checkPath(c.campZone, c.ent2.path) end
+    end
     missing = missing + checkPath(c.landZone, c.returnPath)
     if missing > 0 then fail('%d zone crossing(s) missing for camp [%s]. Ending.', missing, state.campKey) end
 end
@@ -1065,17 +1159,21 @@ local function adventureLoop()
             onFallback = true
             goToCamp(fallback)
         else
-            if c.campSpot then leaveCamp() end
-            if state.useEnt2 then
-                setStep('Travelling to entrance')
-                travelPath(c.ent2.path)
+            if settings.morituri then
+                enterDungeonMorituri()
             else
-                if c.magus then useMagus(c.magus) end
-                setStep('Travelling to entrance')
-                -- does nothing if the Magus already put us in the entrance zone
-                travelPath(c.ent1.path)
+                if c.campSpot then leaveCamp() end
+                if state.useEnt2 then
+                    setStep('Travelling to entrance')
+                    travelPath(c.ent2.path)
+                else
+                    if c.magus then useMagus(c.magus) end
+                    setStep('Travelling to entrance')
+                    -- does nothing if the Magus already put us in the entrance zone
+                    travelPath(c.ent1.path)
+                end
+                enterDungeon()
             end
-            enterDungeon()
             clearDungeon()
             -- after a fallback loop, head back to the original camp
             if onFallback then
@@ -1388,6 +1486,11 @@ local function DrawLDoNUI()
         if rotChanged then state.rotate = rot end
         local bl, blChanged = ImGui.Checkbox(string.format('Give up after %d minutes with no hits##ldonBail', BAIL_AFTER_MIN), state.bail)
         if blChanged then state.bail = bl end
+        local mor, morChanged = ImGui.Checkbox('Morituri Server Mode##ldonMorituri', settings.morituri)
+        if morChanged then settings.morituri = mor; saveConfig() end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Hail the adventure giver and say "' .. MORITURI_SAY .. '" instead of travelling to the dungeon entrance')
+        end
         if state.active then ImGui.EndDisabled() end
 
         ImGui.Separator()
