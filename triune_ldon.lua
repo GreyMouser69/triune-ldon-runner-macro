@@ -80,10 +80,6 @@ local PULLER_OFF_CMD    = '/ac stop'
 local KILL_STALL_MIN, KILL_STALL_MAX = 1, 120
 local KILL_MAX_MIN, KILL_MAX_MAX = 1, 240
 local KILL_POLL_MS = 1000
-local KILL_SCAN_MS = 2000
-local KILL_QUIET_MS = 5000
-local KILL_EMPTY_SCANS = 2
-local KILL_SCAN_CAP = 250
 local KILL_CHURN_MS = 60000
 local KILL_CHURN_PROGRESS_MS = 30000
 
@@ -1037,44 +1033,6 @@ local function isEligibleSpawn(s)
     return not spawnOwnedByFriendly(s, stype, name)
 end
 
-local function countEligibleSpawn(s, seen)
-    local id = tlo(function() return s.ID() end, 0) or 0
-    if id <= 0 or seen[id] then return 0 end
-    seen[id] = true
-    if isEligibleSpawn(s) then return 1 end
-    return 0
-end
-
-local function scanEligibleNpcs()
-    local found = 0
-    local seen = {}
-    for i = 1, KILL_SCAN_CAP do
-        local ok, s = pcall(function() return mq.TLO.NearestSpawn(i, 'npc') end)
-        if not ok then return KILL_SCAN_CAP end
-        if not s then break end
-        local okExists, exists = pcall(function() return s() end)
-        if not okExists then return KILL_SCAN_CAP end
-        if not exists then break end
-        if i == KILL_SCAN_CAP then return KILL_SCAN_CAP end
-        found = found + countEligibleSpawn(s, seen)
-    end
-
-    found = found + countEligibleSpawn(mq.TLO.Target, seen)
-    local slots = clampInt(tlo(function() return mq.TLO.Me.XTargetSlots() end, 13) or 13, 0, 100)
-    for i = 1, slots do
-        found = found + countEligibleSpawn(mq.TLO.Me.XTarget(i), seen)
-    end
-    return found
-end
-
-local function killScanReady()
-    if state.died then return false end
-    if tlo(function() return mq.TLO.Me.Zoning() end, false) == true then return false end
-    if tlo(function() return mq.TLO.Me.Dead() end, false) == true then return false end
-    local meID = tlo(function() return mq.TLO.Me.ID() end, 0)
-    return meID ~= 0 and zoneId() ~= 0 and zoneShort() ~= ''
-end
-
 local function observeTargets(watched)
     local current = {}
     local seen = {}
@@ -1127,22 +1085,19 @@ local function clearRemainingDungeon()
     local targetHistory = {}
     local churnLogged = false
     local nextPoll = 0
-    local nextScan = 0
-    local emptySince = nil
-    local emptyScans = 0
     local doneReason = nil
 
-    local initial = scanEligibleNpcs()
-    log('Kill Everything enabled: clearing remaining NPCs (%d client-visible; stall %d min, max %d min).',
-        initial, settings.killEverythingStallMin, settings.killEverythingMaxMin)
-    setStep('Kill Everything (%d visible)', initial)
+    log('Kill Everything enabled: clearing remaining NPCs; stall %d min = %d ms, max %d min = %d ms.',
+        settings.killEverythingStallMin, stallMs,
+        settings.killEverythingMaxMin, maxMs)
+    setStep('Kill Everything (hunting)')
 
     state.triuneEngaged = true
     mq.cmd(PULLER_HUNT_CMD)
     sleep(500)
     mq.cmd(PULLER_ON_CMD)
 
-    waitFor(math.max(1, maxMs - (mq.gettime() - started)), function()
+    local ok, err = pcall(waitFor, math.max(1, maxMs - (mq.gettime() - started)), function()
         local now = mq.gettime()
 
         if now >= nextPoll then
@@ -1180,35 +1135,6 @@ local function clearRemainingDungeon()
             end
         end
 
-        if now >= nextScan then
-            nextScan = now + KILL_SCAN_MS
-            local remaining = scanEligibleNpcs()
-            local combat = tlo(function() return mq.TLO.Me.Combat() end, false) == true
-                or tlo(function() return mq.TLO.Me.CombatState() end, '') == 'COMBAT'
-            local ready = killScanReady()
-            if remaining == 0 and not combat and ready then
-                if not emptySince then
-                    emptySince = now
-                    emptyScans = 0
-                end
-                emptyScans = emptyScans + 1
-                if emptyScans >= KILL_EMPTY_SCANS and now - emptySince >= KILL_QUIET_MS then
-                    doneReason = 'complete'
-                    return true
-                end
-            else
-                emptySince = nil
-                emptyScans = 0
-            end
-            if remaining > 0 then
-                setStep('Kill Everything (%d visible)', remaining)
-            elseif ready then
-                setStep('Kill Everything (waiting for quiet)')
-            else
-                setStep('Kill Everything (waiting for game state)')
-            end
-        end
-
         if now - state.killLastProgress >= stallMs then
             doneReason = 'stall'
             return true
@@ -1216,16 +1142,27 @@ local function clearRemainingDungeon()
         return false
     end)
 
+    if not ok then
+        local elapsedSec = (mq.gettime() - started) / 1000
+        if type(err) == 'table' and err.ldonAbort then
+            local reason = state.died and 'character died'
+                or state.stopRequested and 'stop requested'
+                or (err.msg or 'aborted')
+            log('Kill Everything: ended after %.1fs: %s.', elapsedSec, reason)
+        else
+            log('Kill Everything: ended after %.1fs due to an error: %s', elapsedSec, tostring(err))
+        end
+        error(err, 0)
+    end
+
+    local elapsedSec = (mq.gettime() - started) / 1000
     if not doneReason then doneReason = 'max' end
-    if doneReason == 'complete' then
-        log('Kill Everything: no eligible living NPCs were found after a %d-second quiet period; leaving.',
-            math.floor(KILL_QUIET_MS / 1000))
-    elseif doneReason == 'stall' then
-        log('Kill Everything: no combat progress for %d minutes; stopping and leaving.',
-            settings.killEverythingStallMin)
+    if doneReason == 'stall' then
+        log('Kill Everything: ended after %.1fs: stall timeout (%d min = %d ms without combat progress).',
+            elapsedSec, settings.killEverythingStallMin, stallMs)
     else
-        log('Kill Everything: maximum additional clearing time (%d minutes) reached; stopping and leaving.',
-            settings.killEverythingMaxMin)
+        log('Kill Everything: ended after %.1fs: maximum timeout (%d min = %d ms).',
+            elapsedSec, settings.killEverythingMaxMin, maxMs)
     end
 end
 
